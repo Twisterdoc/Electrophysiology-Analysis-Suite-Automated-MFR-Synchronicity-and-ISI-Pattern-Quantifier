@@ -1,0 +1,98 @@
+import h5py
+import numpy as np
+import os
+import glob
+import pandas as pd
+
+# --- USER INPUT SECTION ---
+# This will stop the script and wait for you to type the details
+print("--- MEA OUTPUT ANALYSIS TOOL --- ") 
+print("This script is designed for 6 well MEA. It will identify the recorded well as Well 1.")
+folder_path = input("Enter the full path to the folder with extracted .H5 files: ").strip().replace('"', '')
+target_timestamp = input("Enter the timestamp for the file you want to analyse (e.g., 13-58-37): ").strip()
+
+# Fixed parameters
+threshold = -30
+duration = 62
+bin_size = 0.1
+
+def analyze_well_comprehensive(file_path):
+    all_ts = []
+    all_isi = []
+    total_spikes = 0
+    
+    if not os.path.exists(file_path):
+        return 0.0, 0, 0.0, 0.0
+    
+    with h5py.File(file_path, 'r') as f:
+        base = 'Data/Recording_0/SegmentStream/Stream_0'
+        for ch in range(10):
+            ts_path = f"{base}/SegmentData_ts_{ch}"
+            wave_path = f"{base}/SegmentData_{ch}"
+            
+            if ts_path in f and wave_path in f:
+                ts = np.ravel(f[ts_path][:])
+                waves = np.atleast_2d(f[wave_path][:])
+                min_len = min(len(ts), waves.shape[0])
+                if min_len == 0: continue
+                
+                # Filter for spikes
+                peaks = np.min(waves[:min_len, :], axis=1)
+                valid_mask = peaks < threshold
+                spike_ts = ts[:min_len][valid_mask] / 1e5  # convert to seconds
+                
+                # Metrics accumulation
+                total_spikes += len(spike_ts)
+                all_ts.extend(spike_ts)
+                
+                # ISI calculation for this specific electrode
+                if len(spike_ts) >= 2:
+                    all_isi.extend(np.diff(np.sort(spike_ts)))
+    
+    # 1. MFR
+    mfr = total_spikes / (duration * 10)
+    
+    # 2. Synchronicity
+    sync_events = 0
+    if all_ts:
+        bins = np.arange(0, duration + bin_size, bin_size)
+        counts, _ = np.histogram(all_ts, bins=bins)
+        sync_events = np.count_nonzero(counts >= 2)
+    
+    # 3. ISI Metrics
+    median_isi = np.median(all_isi) if all_isi else 0.0
+    cv_isi = np.std(all_isi) / np.mean(all_isi) if all_isi and np.mean(all_isi) > 0 else 0.0
+    
+    return mfr, sync_events, median_isi, cv_isi
+
+# --- EXECUTION ---
+search_pattern = os.path.join(folder_path, f"*{target_timestamp}*.h5")
+files = sorted(glob.glob(search_pattern))
+
+if not files:
+    print(f"No files found for timestamp {target_timestamp} in that folder!")
+else:
+    well_map = {"A": "Well 1 ", "B": "Well 2 ", "C": "Well 3 ", 
+                "D": "Well 4 ", "E": "Well 5 ", "F": "Well 6 "}
+    
+    results = []
+    for file_path in files:
+        # Extract the suffix (A, B, C...) to map the well name
+        char_id = os.path.basename(file_path).split('_')[-1].replace('.h5', '')
+        well_label = well_map.get(char_id, f"Well {char_id}")
+        
+        mfr, sync, med_isi, cv = analyze_well_comprehensive(file_path)
+        
+        results.append({
+            "Well": well_label,
+            "MFR (Hz)": round(mfr, 4),
+            "Sync": sync,
+            "Med_ISI": round(med_isi, 3),
+            "CV_ISI": round(cv, 3)
+        })
+
+    # --- FINAL OUTPUT ---
+    print(f"\nResults for Recording: {target_timestamp}")
+    print("-" * 60)
+    print(pd.DataFrame(results).to_string(index=False))
+    print(GitHub.com/))
