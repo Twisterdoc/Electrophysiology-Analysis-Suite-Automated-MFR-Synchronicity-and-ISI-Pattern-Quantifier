@@ -1,0 +1,2 @@
+# Electrophysiology-Analysis-Suite-Automated-MFR-Synchronicity-and-ISI-Pattern-Quantifier
+ Automated tool for MEA HDF5 data. Processes raw extracellular voltage to track neuronal network maturation.  Key Metrics:  MFR: Total activity levels.  Synchronicity: Coordinated firing bins.  ISI/CV: Statistical proof of bursting vs. random firing.  Stack: Python, h5py, NumPy, Pandas. Optimized for DIV longitudinal studies.
