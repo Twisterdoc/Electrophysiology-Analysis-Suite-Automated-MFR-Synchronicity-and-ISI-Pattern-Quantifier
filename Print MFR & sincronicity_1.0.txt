@@ -95,4 +95,4 @@ else:
     print(f"\nResults for Recording: {target_timestamp}")
     print("-" * 60)
     print(pd.DataFrame(results).to_string(index=False))
-    print(GitHub.com/))
+    print("Analysis complete. Repository reference: GitHub.com/")
