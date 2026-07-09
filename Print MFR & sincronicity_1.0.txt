@@ -1,98 +1,161 @@
 import h5py
 import numpy as np
 import os
-import glob
 import pandas as pd
+import tkinter as tk
+from tkinter import filedialog
 
-# --- USER INPUT SECTION ---
-# This will stop the script and wait for you to type the details
-print("--- MEA OUTPUT ANALYSIS TOOL --- ") 
-print("This script is designed for 6 well MEA. It will identify the recorded well as Well 1.")
-folder_path = input("Enter the full path to the folder with extracted .H5 files: ").strip().replace('"', '')
-target_timestamp = input("Enter the timestamp for the file you want to analyse (e.g., 13-58-37): ").strip()
+print("--- MEA OUTPUT ANALYSIS TOOL (STREAMING MODE) ---") 
+print("Opening file window... Look at your taskbar if it is hidden.")
 
-# Fixed parameters
-threshold = -30
-duration = 62
-bin_size = 0.1
+root = tk.Tk()
+root.withdraw()
+root.lift()
+root.attributes('-topmost', True)
 
-def analyze_well_comprehensive(file_path):
-    all_ts = []
-    all_isi = []
-    total_spikes = 0
+file_paths = filedialog.askopenfilenames(
+    title="Select MEA Analog HDF5 files",
+    filetypes=[("HDF5 files", "*.h5"), ("All files", "*.*")]
+)
+root.destroy()
+
+# Parameters 
+threshold = -200      # Microvolts
+bin_size = 0.1        # 100 ms bins for synchronicity
+
+def analyze_analog_well_streamed(file_path):
+    all_ts, all_isi, total_spikes = [], np.array([]), 0
     
     if not os.path.exists(file_path):
-        return 0.0, 0, 0.0, 0.0
+        return 0.0, 0, 0.0, 0.0, 0.0, 0.0
     
     with h5py.File(file_path, 'r') as f:
-        base = 'Data/Recording_0/SegmentStream/Stream_0'
-        for ch in range(10):
-            ts_path = f"{base}/SegmentData_ts_{ch}"
-            wave_path = f"{base}/SegmentData_{ch}"
+        base = 'Data/Recording_0/AnalogStream/Stream_0'
+        if f"{base}/ChannelData" not in f:
+            print("  [Error] Missing 'ChannelData' internal pathway.")
+            return 0.0, 0, 0.0, 0.0, 0.0, 0.0
             
-            if ts_path in f and wave_path in f:
-                ts = np.ravel(f[ts_path][:])
-                waves = np.atleast_2d(f[wave_path][:])
-                min_len = min(len(ts), waves.shape[0])
-                if min_len == 0: continue
+        data_dset = f[f"{base}/ChannelData"]
+        timestamps = f[f"{base}/ChannelDataTimeStamps"][:]
+        
+        if data_dset.shape[0] > data_dset.shape[1] and data_dset.shape[1] < 100:
+            transpose_needed = True
+            num_channels, num_samples = data_dset.shape[1], data_dset.shape[0]
+        else:
+            transpose_needed = False
+            num_channels, num_samples = data_dset.shape[0], data_dset.shape[1]
+            
+        sampling_rate = 25000
+        if 'InfoChannel' in f[base]:
+            try:
+                inf = f[f"{base}/InfoChannel"]
+                if 'SamplingFrequency' in inf.dtype.names:
+                    sampling_rate = inf['SamplingFrequency'][0]
+            except:
+                pass
+        
+        dynamic_duration = num_samples / sampling_rate
+        refractory_samples = int(0.002 * sampling_rate)
+        chunk_size = int(10 * sampling_rate)
+        
+        last_crossing_global = np.ones(num_channels) * -refractory_samples
+        
+        print(f"  Duration: {round(dynamic_duration, 1)}s | Streaming {num_channels} electrodes in chunks...")
+        
+        for start_idx in range(0, num_samples, chunk_size):
+            end_idx = min(start_idx + chunk_size, num_samples)
+            current_chunk_len = end_idx - start_idx
+            
+            if transpose_needed:
+                chunk = data_dset[start_idx:end_idx, :].T
+            else:
+                chunk = data_dset[:, start_idx:end_idx]
                 
-                # Filter for spikes
-                peaks = np.min(waves[:min_len, :], axis=1)
-                valid_mask = peaks < threshold
-                spike_ts = ts[:min_len][valid_mask] / 1e5  # convert to seconds
+            chunk_time_vector = np.linspace(
+                start_idx / sampling_rate, 
+                end_idx / sampling_rate, 
+                current_chunk_len, 
+                endpoint=False
+            )
+            
+            for ch in range(num_channels):
+                signal = chunk[ch, :]
+                is_below = signal < threshold
+                crossings = np.where(is_below[:-1] & ~is_below[1:])[0]
                 
-                # Metrics accumulation
-                total_spikes += len(spike_ts)
-                all_ts.extend(spike_ts)
+                if len(crossings) == 0:
+                    continue
+                    
+                global_crossings = crossings + start_idx
+                filtered_crossings = []
+                last_idx = last_crossing_global[ch]
                 
-                # ISI calculation for this specific electrode
-                if len(spike_ts) >= 2:
-                    all_isi.extend(np.diff(np.sort(spike_ts)))
+                for idx in global_crossings:
+                    if idx - last_idx > refractory_samples:
+                        filtered_crossings.append(idx - start_idx)
+                        last_idx = idx
+                        
+                last_crossing_global[ch] = last_idx
+                
+                if filtered_crossings:
+                    spike_ts = chunk_time_vector[filtered_crossings]
+                    total_spikes += len(spike_ts)
+                    all_ts.extend(spike_ts)
+        
+        if len(all_ts) >= 2:
+            all_isi = np.diff(np.sort(all_ts))
+            
+    mfr = total_spikes / (dynamic_duration * num_channels) if num_channels > 0 else 0.0
     
-    # 1. MFR
-    mfr = total_spikes / (duration * 10)
-    
-    # 2. Synchronicity
-    sync_events = 0
+    sync_events, sync_rate = 0, 0.0
     if all_ts:
-        bins = np.arange(0, duration + bin_size, bin_size)
+        bins = np.arange(0, dynamic_duration + bin_size, bin_size)
         counts, _ = np.histogram(all_ts, bins=bins)
         sync_events = np.count_nonzero(counts >= 2)
+        sync_rate = sync_events / dynamic_duration 
     
-    # 3. ISI Metrics
-    median_isi = np.median(all_isi) if all_isi else 0.0
-    cv_isi = np.std(all_isi) / np.mean(all_isi) if all_isi and np.mean(all_isi) > 0 else 0.0
-    
-    return mfr, sync_events, median_isi, cv_isi
+    # FIXED: Safe numpy array evaluation using length checking
+    median_isi = np.median(all_isi) if len(all_isi) > 0 else 0.0
+    cv_isi = np.std(all_isi) / np.mean(all_isi) if (len(all_isi) > 0 and np.mean(all_isi) > 0) else 0.0
+        
+    return mfr, sync_events, sync_rate, median_isi, cv_isi, dynamic_duration
 
-# --- EXECUTION ---
-search_pattern = os.path.join(folder_path, f"*{target_timestamp}*.h5")
-files = sorted(glob.glob(search_pattern))
-
-if not files:
-    print(f"No files found for timestamp {target_timestamp} in that folder!")
+# --- EXECUTION ENGINE ---
+if not file_paths:
+    print("\n[Cancelled] No files selected.")
 else:
-    well_map = {"A": "Well 1 ", "B": "Well 2 ", "C": "Well 3 ", 
-                "D": "Well 4 ", "E": "Well 5 ", "F": "Well 6 "}
+    well_map = {"A": "Well 1", "B": "Well 2", "C": "Well 3", 
+                "D": "Well 4", "E": "Well 5", "F": "Well 6",
+                "A1": "Well 1", "B1": "Well 2", "C1": "Well 3",
+                "D1": "Well 4", "E1": "Well 5", "F1": "Well 6"}
     
     results = []
-    for file_path in files:
-        # Extract the suffix (A, B, C...) to map the well name
-        char_id = os.path.basename(file_path).split('_')[-1].replace('.h5', '')
+    print(f"\nProcessing {len(file_paths)} file(s)...")
+    
+    for idx, file_path in enumerate(file_paths, 1):
+        file_name = os.path.splitext(os.path.basename(file_path))[0]
+        print(f"\n[{idx}/{len(file_paths)}] Analyzing File: {file_name}")
+        
+        char_id = file_name.split('_')[-1]
         well_label = well_map.get(char_id, f"Well {char_id}")
         
-        mfr, sync, med_isi, cv = analyze_well_comprehensive(file_path)
+        mfr, sync, sync_rate, med_isi, cv, dynamic_dur = analyze_analog_well_streamed(file_path)
         
         results.append({
-            "Well": well_label,
+            "File Name": file_name,
+            "Well Mapping": well_label,
+            "Duration (s)": round(dynamic_dur, 1),
             "MFR (Hz)": round(mfr, 4),
-            "Sync": sync,
-            "Med_ISI": round(med_isi, 3),
+            "Sync Count": sync,
+            "Sync Rate (Hz)": round(sync_rate, 3),
+            "Med_ISI (s)": round(med_isi, 4),
             "CV_ISI": round(cv, 3)
         })
 
-    # --- FINAL OUTPUT ---
-    print(f"\nResults for Recording: {target_timestamp}")
-    print("-" * 60)
-    print(pd.DataFrame(results).to_string(index=False))
-    print("Analysis complete. Repository reference: GitHub.com/")
+    print("\n" + "=" * 95)
+    print("FINAL SUMMARY REPORT")
+    print("=" * 95)
+    df = pd.DataFrame(results)
+    print(df.to_string(index=False))
+    print("=" * 95)
+    print("Analysis complete.")
