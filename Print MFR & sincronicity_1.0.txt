@@ -22,6 +22,7 @@ root.destroy()
 # Parameters 
 threshold = -200      # Microvolts
 bin_size = 0.1        # 100 ms bins for synchronicity
+max_duration = 60     # seconds to analyze (set to None for the full recording)
 
 def analyze_analog_well_streamed(file_path):
     all_ts, all_isi, total_spikes = [], np.array([]), 0
@@ -53,6 +54,11 @@ def analyze_analog_well_streamed(file_path):
                     sampling_rate = inf['SamplingFrequency'][0]
             except:
                 pass
+   # --- NEW: limit analysis window ---
+        if max_duration is not None:
+            num_samples = min(num_samples, int(max_duration * sampling_rate))
+
+        dynamic_duration = num_samples / sampling_rate
         
         dynamic_duration = num_samples / sampling_rate
         refractory_samples = int(0.002 * sampling_rate)
